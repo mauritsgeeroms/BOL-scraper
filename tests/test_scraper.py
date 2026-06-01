@@ -21,6 +21,8 @@ Run
 
 from __future__ import annotations
 
+import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -28,6 +30,7 @@ import time
 from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
+from selenium.common.exceptions import WebDriverException
 
 import scraper
 
@@ -328,54 +331,167 @@ class TestLogin:
 
 
 # ---------------------------------------------------------------------------
-# Tests: find_search_terms_report_link
+# Tests: report-selection helpers
 # ---------------------------------------------------------------------------
 
-class TestFindSearchTermsReportLink:
-    def _patched_wait(self):
-        wait_mock = MagicMock()
-        wait_mock.until.return_value = None
-        return patch("scraper.WebDriverWait", return_value=wait_mock)
+class TestClickByText:
+    def test_clicks_found_element(self):
+        driver = MagicMock()
+        element = MagicMock()
+        wait = MagicMock()
+        wait.until.return_value = element
+        with patch("scraper.WebDriverWait", return_value=wait):
+            scraper._click_by_text(driver, "Selectie maken", wait)
+        element.click.assert_called_once()
 
-    def test_finds_xlsx_href(self):
-        driver = _make_driver_mock(
-            anchors=[{"href": "https://portal.bol.com/reports/search_terms.xlsx", "text": ""}]
+    def test_raises_when_not_found(self):
+        from selenium.common.exceptions import TimeoutException
+        driver = MagicMock()
+        wait = MagicMock()
+        wait.until.side_effect = TimeoutException("nope")
+        with pytest.raises(RuntimeError, match="Selectie maken"):
+            scraper._click_by_text(driver, "Selectie maken", wait)
+
+    def test_falls_back_to_js_click(self):
+        from selenium.common.exceptions import WebDriverException
+        driver = MagicMock()
+        element = MagicMock()
+        element.click.side_effect = WebDriverException("intercepted")
+        wait = MagicMock()
+        wait.until.return_value = element
+        scraper._click_by_text(driver, "Downloaden", wait)
+        driver.execute_script.assert_called_once()
+
+
+class TestSelectReportCheckbox:
+    """
+    Tests for _select_reports_via_angular (called via _select_report_checkbox).
+
+    execute_script call order inside _select_reports_via_angular:
+      call 0 – diagnostic probe  (always; returns a JSON string or raises)
+      call 1 – Angular form patchValue (js_angular)
+      call 2 – shadow-DOM click fallback (js_click), only if call 1 didn't succeed
+    """
+
+    def _make_wait(self):
+        """Return a wait mock whose .until() succeeds (option-group present)."""
+        wait = MagicMock()
+        wait.until.return_value = MagicMock()
+        return wait
+
+    def _probe_result(self):
+        """Minimal probe JSON that won't raise."""
+        return '{"hostFound":false}'
+
+    # ------------------------------------------------------------------
+    # Primary path: Angular form patchValue succeeds
+    # ------------------------------------------------------------------
+
+    def test_succeeds_via_angular_form(self):
+        """Angular strategy returns 'ok:1' → success, no shadow-DOM call."""
+        driver = MagicMock()
+        # call 0 = probe, call 1 = angular ok
+        driver.execute_script.side_effect = [self._probe_result(), "ok:1"]
+        wait = self._make_wait()
+
+        scraper._select_report_checkbox(driver, "Search terms analysis", wait)
+        assert driver.execute_script.call_count == 2
+
+    def test_succeeds_via_angular_form_multiple_labels(self):
+        """_select_reports_via_angular with 2 labels → ok:2."""
+        driver = MagicMock()
+        driver.execute_script.side_effect = [self._probe_result(), "ok:2"]
+        wait = self._make_wait()
+
+        scraper._select_reports_via_angular(
+            driver, ["Publishers", "Search terms analysis"], wait
         )
-        with self._patched_wait():
-            link = scraper.find_search_terms_report_link(driver)
-        assert link == "https://portal.bol.com/reports/search_terms.xlsx"
+        assert driver.execute_script.call_count == 2
 
-    def test_finds_download_href(self):
-        driver = _make_driver_mock(
-            anchors=[{"href": "https://portal.bol.com/download/report", "text": ""}]
-        )
-        with self._patched_wait():
-            link = scraper.find_search_terms_report_link(driver)
-        assert link == "https://portal.bol.com/download/report"
+    # ------------------------------------------------------------------
+    # Fallback path: Angular fails → shadow-DOM click
+    # ------------------------------------------------------------------
 
-    def test_finds_by_zoektermen_text(self):
-        driver = _make_driver_mock(
-            anchors=[{"href": "https://portal.bol.com/some/path", "text": "Zoektermen analyse"}]
-        )
-        with self._patched_wait():
-            link = scraper.find_search_terms_report_link(driver)
-        assert link == "https://portal.bol.com/some/path"
+    def test_falls_back_to_shadow_dom_click(self):
+        """Angular strategy returns an error → shadow-DOM click is tried."""
+        driver = MagicMock()
+        # call 0 = probe, call 1 = angular err, call 2 = shadow ok
+        driver.execute_script.side_effect = [
+            self._probe_result(), "err:no-options", "ok:publishers"
+        ]
+        wait = self._make_wait()
 
-    def test_finds_download_button_and_clicks_it(self):
-        driver = _make_driver_mock(
-            anchors=[],
-            buttons=[{"text": "Download zoektermen", "aria_label": ""}],
-        )
-        with self._patched_wait():
-            with patch("scraper.time.sleep"):
-                link = scraper.find_search_terms_report_link(driver)
-        assert link == "__button_clicked__"
+        scraper._select_report_checkbox(driver, "Publishers", wait)
+        assert driver.execute_script.call_count == 3
 
-    def test_returns_none_when_nothing_found(self):
-        driver = _make_driver_mock(anchors=[], buttons=[])
-        with self._patched_wait():
-            link = scraper.find_search_terms_report_link(driver)
-        assert link is None
+    def test_raises_when_both_strategies_fail(self):
+        """Both Angular and shadow-DOM strategies fail → RuntimeError."""
+        driver = MagicMock()
+        driver.execute_script.side_effect = [
+            self._probe_result(), "err:no-options", "err:none-clicked"
+        ]
+        wait = self._make_wait()
+
+        with pytest.raises(RuntimeError, match="Publishers"):
+            scraper._select_report_checkbox(driver, "Publishers", wait)
+
+    # ------------------------------------------------------------------
+    # Wait timeout → RuntimeError before any JS runs
+    # ------------------------------------------------------------------
+
+    def test_raises_when_option_group_missing(self):
+        """TimeoutException waiting for puik-form-option-group → RuntimeError."""
+        from selenium.common.exceptions import TimeoutException
+        driver = MagicMock()
+        wait = MagicMock()
+        wait.until.side_effect = TimeoutException("missing")
+        with pytest.raises(RuntimeError, match="option group"):
+            scraper._select_report_checkbox(driver, "Some report", wait)
+
+    # ------------------------------------------------------------------
+    # Probe failure is non-fatal
+    # ------------------------------------------------------------------
+
+    def test_probe_exception_is_non_fatal(self):
+        """If the diagnostic probe raises, the main strategy still runs."""
+        driver = MagicMock()
+        # probe raises, angular returns ok
+        driver.execute_script.side_effect = [Exception("probe error"), "ok:1"]
+        wait = self._make_wait()
+
+        scraper._select_report_checkbox(driver, "Search terms analysis", wait)
+        assert driver.execute_script.call_count == 2
+
+    def test_raises_when_label_missing_in_both(self):
+        """Angular and shadow-DOM both return errors → RuntimeError mentions label."""
+        driver = MagicMock()
+        driver.execute_script.side_effect = [
+            self._probe_result(), "err:no-match", "err:none-clicked"
+        ]
+        wait = self._make_wait()
+
+        with pytest.raises(RuntimeError, match="Missing report"):
+            scraper._select_report_checkbox(driver, "Missing report", wait)
+
+
+class TestWaitForDownloadReadyButton:
+    def test_returns_button_when_ready(self):
+        driver = MagicMock()
+        button = MagicMock()
+        button.is_displayed.return_value = True
+        button.is_enabled.return_value = True
+        driver.find_elements.return_value = [button]
+        with patch("scraper.time.sleep"):
+            result = scraper.wait_for_download_ready_button(driver, timeout=30)
+        assert result is button
+
+    def test_raises_timeout_when_never_ready(self):
+        driver = MagicMock()
+        driver.find_elements.return_value = []
+        with patch("scraper.time.sleep"):
+            with patch("scraper.time.time", side_effect=[0, 1, 200]):
+                with pytest.raises(TimeoutError, match="Downloaden"):
+                    scraper.wait_for_download_ready_button(driver, timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +519,7 @@ class TestWaitForDownload:
     def test_raises_timeout_when_no_file(self, tmp_path):
         with patch("scraper.time.sleep"):
             with patch("scraper.time.time", side_effect=[0, 1, 200]):  # instant timeout
-                with pytest.raises(TimeoutError, match="No XLSX file"):
+                with pytest.raises(TimeoutError, match="No download"):
                     scraper.wait_for_download(tmp_path, timeout=5)
 
     def test_ignores_crdownload_partial_files(self, tmp_path):
@@ -425,32 +541,276 @@ class TestWaitForDownload:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _parse_weeks
+# ---------------------------------------------------------------------------
+
+class TestParseWeeks:
+    def test_single_week(self):
+        assert scraper._parse_weeks("18") == [18]
+
+    def test_multiple_weeks_sorted_deduplicated(self):
+        assert scraper._parse_weeks("20,18,19,18") == [18, 19, 20]
+
+    def test_strips_spaces(self):
+        assert scraper._parse_weeks(" 18 , 19 ") == [18, 19]
+
+    def test_raises_on_non_integer(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="valid week number"):
+            scraper._parse_weeks("18,foo")
+
+    def test_raises_on_empty_string(self):
+        with pytest.raises(argparse.ArgumentTypeError, match="[Aa]t least one"):
+            scraper._parse_weeks("  ")
+
+
+# ---------------------------------------------------------------------------
+# Tests: _weeks_to_date_range
+# ---------------------------------------------------------------------------
+
+class TestWeeksToDateRange:
+    def test_single_week(self):
+        # ISO week 20 of 2026: Mon 2026-05-11 → Sun 2026-05-17
+        start, end = scraper._weeks_to_date_range([20], year=2026)
+        assert start == datetime.date(2026, 5, 11)
+        assert end   == datetime.date(2026, 5, 17)
+        assert start.weekday() == 0  # Monday
+        assert end.weekday()   == 6  # Sunday
+
+    def test_contiguous_weeks(self):
+        # Weeks 18–20 of 2026: Mon 2026-04-27 → Sun 2026-05-17
+        start, end = scraper._weeks_to_date_range([18, 19, 20], year=2026)
+        assert start == datetime.date(2026, 4, 27)
+        assert end   == datetime.date(2026, 5, 17)
+
+    def test_non_consecutive_weeks_span(self):
+        # Weeks 18 and 21: gaps are included in the span
+        start, end = scraper._weeks_to_date_range([18, 21], year=2026)
+        assert start == datetime.date(2026, 4, 27)  # Mon of week 18
+        assert end   == datetime.date(2026, 5, 24)  # Sun of week 21
+
+    def test_order_of_input_does_not_matter(self):
+        a = scraper._weeks_to_date_range([20, 18, 19], year=2026)
+        b = scraper._weeks_to_date_range([18, 19, 20], year=2026)
+        assert a == b
+
+    def test_defaults_to_current_year(self):
+        today = datetime.date.today()
+        current_year = today.isocalendar()[0]
+        start, end = scraper._weeks_to_date_range([1])
+        assert start == datetime.date.fromisocalendar(current_year, 1, 1)
+        assert end   == datetime.date.fromisocalendar(current_year, 1, 7)
+
+    def test_raises_on_empty_list(self):
+        with pytest.raises(ValueError, match="[Aa]t least one"):
+            scraper._weeks_to_date_range([])
+
+    def test_raises_on_week_zero(self):
+        with pytest.raises(ValueError, match="out of range"):
+            scraper._weeks_to_date_range([0], year=2026)
+
+    def test_raises_on_week_54(self):
+        with pytest.raises(ValueError, match="out of range"):
+            scraper._weeks_to_date_range([54], year=2026)
+
+    def test_raises_on_week_53_in_short_year(self):
+        # 2021 only has 52 ISO weeks; week 53 does not exist
+        with pytest.raises(ValueError, match="does not exist"):
+            scraper._weeks_to_date_range([53], year=2021)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _validate_date_range
+# ---------------------------------------------------------------------------
+
+class TestValidateDateRange:
+    def test_valid_monday_to_sunday(self):
+        # 2026-05-18 is a Monday, 2026-05-24 is a Sunday
+        scraper._validate_date_range(
+            datetime.date(2026, 5, 18),
+            datetime.date(2026, 5, 24),
+        )  # should not raise
+
+    def test_valid_multi_week(self):
+        # Mon 2026-05-11 → Sun 2026-05-24
+        scraper._validate_date_range(
+            datetime.date(2026, 5, 11),
+            datetime.date(2026, 5, 24),
+        )
+
+    def test_raises_when_start_not_monday(self):
+        with pytest.raises(ValueError, match="Monday"):
+            scraper._validate_date_range(
+                datetime.date(2026, 5, 19),  # Tuesday
+                datetime.date(2026, 5, 24),
+            )
+
+    def test_raises_when_end_not_sunday(self):
+        with pytest.raises(ValueError, match="Sunday"):
+            scraper._validate_date_range(
+                datetime.date(2026, 5, 18),
+                datetime.date(2026, 5, 23),  # Saturday
+            )
+
+    def test_raises_when_start_after_end(self):
+        with pytest.raises(ValueError, match="before"):
+            scraper._validate_date_range(
+                datetime.date(2026, 5, 25),  # Monday after the Sunday
+                datetime.date(2026, 5, 24),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _set_date_range
+# ---------------------------------------------------------------------------
+
+class TestSetDateRange:
+    def _make_wait(self):
+        wait = MagicMock()
+        wait.until.return_value = MagicMock()
+        return wait
+
+    def test_dispatches_puik_change_event(self):
+        """execute_script is called with 6 date-component integers and returns 'ok'."""
+        driver = MagicMock()
+        driver.execute_script.return_value = "ok"
+        wait = self._make_wait()
+
+        scraper._set_date_range(
+            driver,
+            datetime.date(2026, 5, 18),
+            datetime.date(2026, 5, 24),
+            wait,
+        )
+        driver.execute_script.assert_called_once()
+        # Args: js_snippet, sy, sm, sd, ey, em, ed
+        call_args = driver.execute_script.call_args[0]
+        assert call_args[1] == 2026 and call_args[2] == 5  and call_args[3] == 18  # start
+        assert call_args[4] == 2026 and call_args[5] == 5  and call_args[6] == 24  # end
+
+    def test_raises_when_element_missing(self):
+        """execute_script returns an error string → RuntimeError."""
+        driver = MagicMock()
+        driver.execute_script.return_value = "err:no-element"
+        wait = self._make_wait()
+
+        with pytest.raises(RuntimeError, match="date range"):
+            scraper._set_date_range(
+                driver,
+                datetime.date(2026, 5, 18),
+                datetime.date(2026, 5, 24),
+                wait,
+            )
+
+    def test_raises_when_date_picker_not_found_in_dom(self):
+        """TimeoutException waiting for puik-form-date → RuntimeError."""
+        from selenium.common.exceptions import TimeoutException
+        driver = MagicMock()
+        wait = MagicMock()
+        wait.until.side_effect = TimeoutException("missing")
+
+        with pytest.raises(RuntimeError, match="date-range picker"):
+            scraper._set_date_range(
+                driver,
+                datetime.date(2026, 5, 18),
+                datetime.date(2026, 5, 24),
+                wait,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Tests: download_search_terms_report
 # ---------------------------------------------------------------------------
 
 class TestDownloadSearchTermsReport:
-    def test_navigates_and_downloads(self, tmp_path):
+    def test_runs_full_wizard_and_downloads(self, tmp_path):
         driver = _make_driver_mock(
-            anchors=[{"href": "https://portal.bol.com/reports/zoektermen.xlsx", "text": ""}]
+            current_url="https://portal.bol.com/supplier/insight/"
         )
-        xlsx_file = tmp_path / "zoektermen.xlsx"
+        zip_file = tmp_path / "reports.zip"
+        download_button = MagicMock()
 
         with patch("scraper.WebDriverWait", return_value=MagicMock(until=MagicMock())):
-            with patch("scraper.wait_for_download", return_value=xlsx_file):
-                result = scraper.download_search_terms_report(driver, tmp_path)
+            with patch("scraper.navigate_to_insight"):
+                with patch("scraper._click_by_text") as mock_click:
+                    with patch("scraper._select_report_checkbox") as mock_select:
+                        with patch("scraper._set_date_range") as mock_date:
+                            with patch(
+                                "scraper.wait_for_download_ready_button",
+                                return_value=download_button,
+                            ):
+                                with patch(
+                                    "scraper.wait_for_download", return_value=zip_file
+                                ):
+                                    result = scraper.download_search_terms_report(
+                                        driver, tmp_path
+                                    )
 
-        assert result == xlsx_file
-        driver.get.assert_any_call(scraper.SUPPLIER_INSIGHT_URL)
+        assert result == zip_file
+        # Selectie maken + Download gereed maken => two _click_by_text calls.
+        assert mock_click.call_count == 2
+        # One checkbox per required report.
+        assert mock_select.call_count == len(scraper.REQUIRED_REPORT_LABELS)
+        # No date range set when omitted.
+        mock_date.assert_not_called()
+        download_button.click.assert_called_once()
 
-    def test_raises_when_link_not_found(self, tmp_path):
-        driver = _make_driver_mock(anchors=[], buttons=[])
+    def test_sets_date_range_when_provided(self, tmp_path):
+        """When start/end dates are passed, _set_date_range is called once."""
+        driver = _make_driver_mock(
+            current_url="https://portal.bol.com/supplier/insight/"
+        )
+        zip_file = tmp_path / "reports.zip"
+        start = datetime.date(2026, 5, 18)
+        end   = datetime.date(2026, 5, 24)
 
         with patch("scraper.WebDriverWait", return_value=MagicMock(until=MagicMock())):
-            with pytest.raises(RuntimeError, match="not found on the insight page"):
-                scraper.download_search_terms_report(driver, tmp_path)
+            with patch("scraper.navigate_to_insight"):
+                with patch("scraper._click_by_text"):
+                    with patch("scraper._select_report_checkbox"):
+                        with patch("scraper._set_date_range") as mock_date:
+                            with patch(
+                                "scraper.wait_for_download_ready_button",
+                                return_value=MagicMock(),
+                            ):
+                                with patch(
+                                    "scraper.wait_for_download", return_value=zip_file
+                                ):
+                                    scraper.download_search_terms_report(
+                                        driver, tmp_path,
+                                        start_date=start, end_date=end,
+                                    )
 
-        # debug page should have been written
-        assert (tmp_path / "debug_page.html").exists()
+        mock_date.assert_called_once()
+        call_kwargs = mock_date.call_args
+        assert call_kwargs[0][1] == start
+        assert call_kwargs[0][2] == end
+
+    def test_raises_when_only_start_date_given(self, tmp_path):
+        """Providing start_date without end_date raises ValueError immediately."""
+        driver = _make_driver_mock(
+            current_url="https://portal.bol.com/supplier/insight/"
+        )
+        with pytest.raises(ValueError, match="both"):
+            scraper.download_search_terms_report(
+                driver, tmp_path,
+                start_date=datetime.date(2026, 5, 18),
+            )
+
+    def test_saves_debug_page_when_selection_fails(self, tmp_path):
+        driver = _make_driver_mock(
+            current_url="https://portal.bol.com/supplier/insight/"
+        )
+
+        with patch("scraper.WebDriverWait", return_value=MagicMock(until=MagicMock())):
+            with patch("scraper.navigate_to_insight"):
+                with patch(
+                    "scraper._click_by_text",
+                    side_effect=RuntimeError("Could not find 'Selectie maken'"),
+                ):
+                    with pytest.raises(RuntimeError, match="Selectie maken"):
+                        scraper.download_search_terms_report(driver, tmp_path)
+
+        assert (tmp_path / "debug_insight_page.html").exists()
 
 
 # ---------------------------------------------------------------------------
